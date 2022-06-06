@@ -16,6 +16,19 @@ def is_number(s):
     except ValueError:
         return False
 
+GLASSCAT_RLE2ZMX = {
+    'S':'SCHOTT',
+    'G':'CDGM',
+    'R':'LZOS'
+}
+
+def zmx_glass_name_reformat(gn: str):
+    gn = gn.replace("'",'')
+    if gn[0:2].lower() == 'lz':
+        return gn.replace('-', '_')
+    else:
+        return gn
+
 class SynObject:
     OBA = 1
     OBB = 2
@@ -24,17 +37,25 @@ class SynObject:
     OBG = 5
 
 class Surface:
-    def __init__(self, cv=0, n=1, d=0, v=1, D=1, air=True, is_stop=False, d_infty=False):
+    def __init__(self, cv=0, n=1, d=0, v=1, D=1, air=True, is_stop=False, d_infty=False, glass=''):
         self.cv = cv
         self.n = n
         self.d = d
         self.v = v
         self.D = D
         self.air=air
+        self.glass=glass
         self.is_stop=is_stop
         self.d_infty=d_infty
     def rle(self):
         return f"CV {self.cv} TH {self.d}" + (" AIR" if self.air else f" GLM {self.n} {self.v}")
+    def _zmx_glass(self):
+        if self.air:
+            return ''
+        elif self.glass=='':
+            return f"GLAS ___BLANK 1 0 {self.n} {self.v} 5E-3 0 0 0 0 0"
+        else:
+            return f"GLAS {zmx_glass_name_reformat(self.glass)} 0 0 1.5 4.0E+1 0 0 0 0 0 0 "
     def zmx(self):
         return f"""
         TYPE STANDARD
@@ -42,7 +63,7 @@ class Surface:
         HIDE 0 0 0 0 0 0 0 0 0 0
         MIRR 2 0
         DISZ {self.d if not self.d_infty else 'INFINITY'}
-        {f"GLAS ___BLANK 1 0 {self.n} {self.v} 5E-3 0 0 0 0 0" if not self.air else ''}
+        {self._zmx_glass()}
         DIAM {0.5*self.D} {int(self.is_stop)} 0 0 1 ""
         """
 class Lens:
@@ -60,6 +81,7 @@ class Lens:
         self.stop_surf_i=-1
         self.ray_aiming=False
         self.obj_type=SynObject.OBB
+        self.glass_catalogs=set()
         self._rleparse(lines)
     def _rleparse(self, lines):
         for line in lines:
@@ -71,7 +93,10 @@ class Lens:
                 YP1 = float(words[3]) # YP1 = -sP*tg(w)
                 self.sP = -YP1/tan(radians(self.w))
             elif words[0] == 'ID':
-                self.name = 'Synopsys ' + words[1] + ' LOG No=' + words[2]
+                if len(words)>2:
+                    self.name = f"Synopsys {words[1]} LOG {words[2]}"
+                else:
+                    self.name = F"LOG {words[1]}"
             elif words[0] == 'WAVL':
                 if not is_number(words[1]): continue
                 self.waves = [float(w) for w in words[1:]]
@@ -109,11 +134,18 @@ class Lens:
                             srf.v = float(v)
                         case 'AIR':
                             srf.air = True
+                        case 'GTB':
+                            srf.air = False
+                            catalog, name = next(it, None)
+                            srf.glass = name[1:] # 1st char is ' as in 'LZ-K8  '
+                            self.glass_catalogs.add(catalog)
         if self.obj_type == SynObject.OBB:
             self.surfaces[0].d_infty=True
         if self.implied_stop:
             self.surfaces[1].d = self.sP
             self.surfaces[1].D = self.D
+    def _zmx_glasscat(self):
+        return ' '.join([GLASSCAT_RLE2ZMX[cat] for cat in self.glass_catalogs])
     def _zmx_sys(self, glasscat, zmx_version):
         sys = f"""
         VERS {zmx_version}
@@ -125,7 +157,7 @@ class Lens:
         {'FLOA' if self.implied_stop else ''}
         ENVD 2.0E+1 1 0
         GFAC 0 0
-        GCAT {glasscat}
+        GCAT {self._zmx_glasscat() if glasscat=='' else glasscat}
         RAIM 0 {'2' if self.ray_aiming else '0'} 1 1 0 0 0 0 0
         SDMA 0 1 0
         FTYP 0 0 3 3 0 0 0
@@ -141,7 +173,7 @@ class Lens:
         GLRS 1 0
         """
         return sys
-    def zmx(self, zmx_version, glasscat='LZOS SCHOTT CDGM'):
+    def zmx(self, zmx_version, glasscat=''):
         sys = self._zmx_sys(glasscat, zmx_version)
         surfs = ''
         for i, s in enumerate(self.surfaces):
@@ -161,8 +193,9 @@ ap.add_argument(
     '--zmx-version',
     '-v',
     type=str,
-    required=True,
     dest='zmx_version',
+    required=False,
+    default='140820 75 34900',
     help='Zemax version string (string after VERS in a .zmx file)'
 )
 ap.add_argument(
@@ -174,19 +207,11 @@ ap.add_argument(
     default='./'
 )
 ap.add_argument(
-    "--name",
-    "-n",
-    type=str,
-    required=False,
-    dest='name',
-    help="Name of .zmx file"
-)
-ap.add_argument(
     "--glasscat",
     '-g',
     required=False,
     type=str,
-    default='SCHOTT CDGM',
+    default='',
     dest='glass',
     help="String of glass catalogs as in Zemax system options, e.g 'LZOS CDGM'"
 )
@@ -199,8 +224,7 @@ if not os.path.isdir(out_dir):
     print('ERROR: specified output dir cannot be found, likely does not exist')
     os._exit(1)
 lens = Lens(rle_path)
-zmx_name = rle_name if args.name is None else args.name
-zmx_path = os.path.join(out_dir, f"{zmx_name}.zmx")
+zmx_path = os.path.join(out_dir, f"{rle_name}.zmx")
 with io.open(zmx_path, 'w') as zmx_file:
     print(f"Saving {zmx_path}...")
     zmx_file.write(lens.zmx(args.zmx_version, args.glass))
